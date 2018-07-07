@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -10,30 +11,6 @@ import (
 
 	"github.com/golang/glog"
 )
-
-type Client struct {
-	Conn       net.Conn
-	Buffer     *Buffer
-	State      int
-	TubeName   string
-	Cmd        string
-	CmdRead    int
-	CurrentJob *Job
-}
-
-type Job struct {
-	ID      uint64
-	Pri     int
-	Delay   int
-	TTR     int
-	BodyLen int
-	Body    []byte
-}
-
-type Tube struct {
-	Name string
-	Jobs []Job
-}
 
 type Server struct {
 	Tubes  map[string]*Tube
@@ -58,13 +35,13 @@ var (
 	flagPersistDir = flag.String("b", "", "binlog persistent dir")
 	flagListenPort = flag.String("p", "11300", "port")
 
-	MSG_OUT_OF_MEMORY   = []byte("OUT_OF_MEMORY\r\n")
-	MSG_INTERNAL_ERROR  = []byte("INTERNAL_ERROR\r\n")
-	MSG_DRAINING        = []byte("DRAINING\r\n")
-	MSG_BAD_FORMAT      = []byte("BAD_FORMAT\r\n")
-	MSG_UNKNOWN_COMMAND = []byte("UNKNOWN_COMMAND\r\n")
-	MSG_EXPECTED_CRLF   = []byte("EXPECTED_CRLF\r\n")
-	MSG_JOB_TOO_BIG     = []byte("JOB_TOO_BIG\r\n")
+	MSG_OUT_OF_MEMORY   = "OUT_OF_MEMORY\r\n"
+	MSG_INTERNAL_ERROR  = "INTERNAL_ERROR\r\n"
+	MSG_DRAINING        = "DRAINING\r\n"
+	MSG_BAD_FORMAT      = "BAD_FORMAT\r\n"
+	MSG_UNKNOWN_COMMAND = "UNKNOWN_COMMAND\r\n"
+	MSG_EXPECTED_CRLF   = "EXPECTED_CRLF\r\n"
+	MSG_JOB_TOO_BIG     = "JOB_TOO_BIG\r\n"
 )
 
 var (
@@ -79,21 +56,19 @@ func dispatchCommand(conn net.Conn, data []byte, n int) {
 
 }
 
-func SaveJob(client *Client, j *Job) {
-	jobs := &server.Tubes[client.TubeName].Jobs
-	*jobs = append(*jobs, *j)
-}
-
-func DeleteJob(client *Client, id uint64) error {
-	jobs := &server.Tubes[client.TubeName].Jobs
-	for i, j := range *jobs {
-		if j.ID == id {
-			*jobs = append((*jobs)[:i], (*jobs)[i+1:]...)
-			return nil
+func GetMinPriJob(client *Client) *Job {
+	tube := server.Tubes[client.TubeName]
+	for _, job := range tube.Jobs {
+		if job.Pri == tube.MinPri {
+			return &job
 		}
 	}
-	return fmt.Errorf("not find")
+
+	// no ready job, waiting
+
+	return nil
 }
+
 func SplitCmdString(cmd string) []string {
 	args := make([]string, 0)
 	start := -1
@@ -126,31 +101,31 @@ func doCmd(client *Client) {
 	// <data>\r\n
 	case "put":
 		if len(args) != 5 {
-			client.Conn.Write(MSG_BAD_FORMAT)
+			client.SendMsg(MSG_BAD_FORMAT)
 			return
 		}
 
-		pri, err := strconv.Atoi(args[1])
+		pri, err := strconv.ParseUint(args[1], 10, 32)
 		if err != nil {
-			client.Conn.Write(MSG_BAD_FORMAT)
+			client.SendMsg(MSG_BAD_FORMAT)
 			return
 		}
 
 		delay, err := strconv.Atoi(args[2])
 		if err != nil {
-			client.Conn.Write(MSG_BAD_FORMAT)
+			client.SendMsg(MSG_BAD_FORMAT)
 			return
 		}
 
 		ttr, err := strconv.Atoi(args[3])
 		if err != nil {
-			client.Conn.Write(MSG_BAD_FORMAT)
+			client.SendMsg(MSG_BAD_FORMAT)
 			return
 		}
 
 		bodyLen, err := strconv.Atoi(args[4])
 		if err != nil {
-			client.Conn.Write(MSG_BAD_FORMAT)
+			client.SendMsg(MSG_BAD_FORMAT)
 			return
 		}
 
@@ -159,37 +134,46 @@ func doCmd(client *Client) {
 		body := make([]byte, bodyLen)
 		client.Buffer.Read(body)
 		if string(body[bodyLen-2:]) != "\r\n" {
-			client.Conn.Write(MSG_EXPECTED_CRLF)
+			client.SendMsg(MSG_EXPECTED_CRLF)
 			return
 		}
 
 		job := &Job{
 			ID:      genJobID(),
-			Pri:     pri,
+			Pri:     uint32(pri),
 			Delay:   delay,
 			TTR:     ttr,
 			BodyLen: bodyLen, Body: body}
 
-		SaveJob(client, job)
-		client.Conn.Write([]byte(fmt.Sprintf("INSERTED %d\r\n", job.ID)))
+		client.SaveJob(job)
+		client.SendMsg(fmt.Sprintf("INSERTED %d\r\n", job.ID))
 	case "delete":
 		if len(args) != 2 {
-			client.Conn.Write(MSG_BAD_FORMAT)
+			client.SendMsg(MSG_BAD_FORMAT)
 			return
 		}
 
 		id, err := strconv.ParseUint(args[1], 10, 64)
 		if err != nil {
-			client.Conn.Write(MSG_BAD_FORMAT)
+			client.SendMsg(MSG_BAD_FORMAT)
 			return
 		}
-		if err := DeleteJob(client, id); err != nil {
+		if err := client.DeleteJob(id); err != nil {
 			client.Conn.Write([]byte("NOT_FOUND\r\n"))
 		} else {
 			client.Conn.Write([]byte("DELETED\r\n"))
 		}
+	case "reserve", "reserve-with-timeout":
+		job := GetMinPriJob(client)
+		if job != nil {
+			str := fmt.Sprintf("RESERVED %d %d\r\n", job.ID, job.BodyLen-2)
+			client.Conn.Write([]byte(str))
+			client.Conn.Write(job.Body)
+			client.DeleteJob(job.ID)
+		}
+
 	default:
-		client.Conn.Write(MSG_UNKNOWN_COMMAND)
+		client.SendMsg(MSG_UNKNOWN_COMMAND)
 
 	}
 
@@ -203,7 +187,8 @@ func handleConn(conn net.Conn) {
 		Buffer:   NewBuffer(LINE_SIZE),
 		TubeName: "default",
 		State:    STATE_WANTCOMMAND,
-		CmdRead:  0}
+		CmdRead:  0,
+		JobChan:  make(chan *Job, 1)}
 
 	data := make([]byte, LINE_SIZE)
 	go func() {
@@ -225,12 +210,11 @@ func handleConn(conn net.Conn) {
 		for {
 			n, err := client.Buffer.ReadToEnd(data)
 			if err != nil {
-				client.Conn.Write(MSG_BAD_FORMAT)
+				client.SendMsg(MSG_BAD_FORMAT)
 			}
 
 			client.Cmd = string(data[:n])
 			doCmd(client)
-
 		}
 
 	}()
@@ -260,5 +244,5 @@ func main() {
 
 func init() {
 	server.Tubes = make(map[string]*Tube, 0)
-	server.Tubes["default"] = &Tube{Jobs: make([]Job, 0)}
+	server.Tubes["default"] = &Tube{Jobs: make([]Job, 0), MinPri: math.MaxUint32}
 }
